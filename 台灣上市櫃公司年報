@@ -1,0 +1,180 @@
+# 必要的導入
+import time
+import re
+import os
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium import webdriver
+from concurrent.futures import ThreadPoolExecutor
+
+# 設置下載目錄，確認掛載了 Google Drive
+download_dir = "/content/drive/MyDrive/量化交易/"
+
+# 設置 Chrome WebDriver 選項
+chrome_options = webdriver.ChromeOptions()
+chrome_options.add_argument('--headless')  # 在後台運行
+chrome_options.add_argument('--no-sandbox')
+chrome_options.add_argument('--disable-dev-shm-usage')
+
+# 設定自動下載的路徑
+prefs = {
+    "download.default_directory": download_dir,  # 指定下載目錄
+    "download.prompt_for_download": False,       # 不顯示下載對話框
+    "download.directory_upgrade": True,
+    "plugins.always_open_pdf_externally": True   # PDF 文件不在瀏覽器中打開，直接下載
+}
+chrome_options.add_experimental_option('prefs', prefs)
+
+# 4. 抓取台灣上市公司代碼
+def fetch_twse_symbols():
+    url = 'https://isin.twse.com.tw/isin/C_public.jsp?strMode=2'
+    response = requests.get(url)
+    response.encoding = 'big5'
+    soup = BeautifulSoup(response.text, 'html.parser')
+    table = soup.find('table', {'class': 'h4'})
+    rows = table.find_all('tr')[1:]
+
+    symbols = []
+    for row in rows:
+        cols = row.find_all('td')
+        if len(cols) > 1 and cols[0].text.strip():
+            code_name = cols[0].text.strip().split()
+            if len(code_name) == 2 and code_name[0].isdigit():
+                symbols.append({
+                    'symbol': code_name[0],  # 不再附加 '.TW'，以便在年報查詢中使用
+                    'name': code_name[1]
+                })
+    return symbols
+
+# 5. 抓取台灣櫃檯買賣公司代碼
+def fetch_otc_symbols():
+    url = 'https://isin.twse.com.tw/isin/C_public.jsp?strMode=4'
+    response = requests.get(url)
+    response.encoding = 'big5'
+    soup = BeautifulSoup(response.text, 'html.parser')
+    table = soup.find('table', {'class': 'h4'})
+    rows = table.find_all('tr')[1:]
+
+    symbols = []
+    for row in rows:
+        cols = row.find_all('td')
+        if len(cols) > 1 and cols[0].text.strip():
+            code_name = cols[0].text.strip().split()
+            if len(code_name) == 2 and code_name[0].isdigit():
+                symbols.append({
+                    'symbol': code_name[0],  # 不再附加 '.TWO'，以便在年報查詢中使用
+                    'name': code_name[1]
+                })
+    return symbols
+
+# 6. 合併上市和櫃檯買賣公司代碼
+def fetch_all_taiwan_symbols():
+    twse_symbols = fetch_twse_symbols()
+    otc_symbols = fetch_otc_symbols()
+
+    # 合併上市和櫃檯股票代碼
+    all_symbols_df = pd.DataFrame(twse_symbols + otc_symbols)
+    filtered_df = all_symbols_df[~all_symbols_df['name'].str.contains('購')]  # 過濾掉包含 "購" 的項目
+    filtered_df = filtered_df[filtered_df['symbol'].str.len() == 4]  # 保留4位數的代碼
+    return filtered_df['symbol'].tolist()  # 回傳只包含代碼的列表
+
+# 等待下載完成檢查
+def wait_for_download_to_complete(download_dir, timeout=60):
+    """檢查下載是否完成，最多等待 timeout 秒"""
+    end_time = time.time() + timeout
+    while True:
+        if not any([filename.endswith('.crdownload') for filename in os.listdir(download_dir)]):
+            print("下載完成")
+            return True
+        if time.time() > end_time:
+            print("下載超時")
+            return False
+        time.sleep(5)  # 每5秒檢查一次
+
+# 瀏覽每個公司的年報並下載PDF
+def download_annual_report(公司):
+    driver = webdriver.Chrome(options=chrome_options)
+    try:
+        url = f'https://doc.twse.com.tw/server-java/t57sb01?step=1&co_id={公司}&year=110&mtype=F'
+        driver.get(url)
+        print(f'訪問的URL：{url}')
+
+        # 等待頁面加載
+        time.sleep(3)
+
+        try:
+            # 查找包含"F04"的連結
+            link_element = driver.find_element(By.XPATH, '//a[contains(text(), "F04")]')
+            link_element.click()  # 點擊連結，這可能會打開新視窗
+            time.sleep(2)  # 等待新視窗彈出
+
+            # 獲取所有視窗的句柄
+            windows = driver.window_handles
+            if len(windows) > 1:
+                # 切換到新視窗
+                driver.switch_to.window(windows[-1])
+                print("已切換到新視窗")
+
+                # 在新視窗中查找需要點擊的PDF連結
+                try:
+                    new_link_element = driver.find_element(By.XPATH, '//a[contains(text(), "F04")]')
+                    new_link = new_link_element.get_attribute('href')
+
+                    if 'javascript:readfile2' in new_link:
+                        # 解析JavaScript函數的參數
+                        match = re.search(r'readfile2\((.*?)\);', new_link)
+                        if match:
+                            params = match.group(1)
+                            args = [arg.strip().strip('"') for arg in params.split(',')]
+                            if len(args) == 3:
+                                type_code, co_id, file_name = args
+                                # 構建PDF下載的URL
+                                pdf_url = f'https://doc.twse.com.tw/pdf/{file_name}'
+                                print(f"正在下載：{pdf_url}")
+                                driver.get(pdf_url)
+
+                                # 等待下載完成
+                                wait_for_download_to_complete(download_dir)
+                                print(f"{file_name} 下載完成")
+                            else:
+                                print("解析參數時出錯")
+                        else:
+                            print("未能匹配到JavaScript函數的參數")
+                    else:
+                        # 直接下載PDF
+                        print(f"正在下載：{new_link}")
+                        driver.get(new_link)
+                        wait_for_download_to_complete(download_dir)
+                        print("PDF下載完成")
+                except NoSuchElementException:
+                    print(f"公司代碼 {公司} 的PDF連結在新視窗中未找到")
+
+                finally:
+                    # 關閉新視窗，返回原始視窗
+                    driver.close()
+                    driver.switch_to.window(windows[0])  # 切回原視窗
+            else:
+                print(f"未彈出新視窗，檢查連結或頁面結構")
+
+        except NoSuchElementException:
+            print(f"公司代碼 {公司} 未找到年報連結")
+
+    except TimeoutException as e:
+        print(f"超時錯誤，無法下載公司代碼 {公司} 的年報: {str(e)}")
+    finally:
+        driver.quit()  # 確保在所有情況下關閉瀏覽器
+
+# 抓取所有台灣上市與櫃檯股票代碼
+公司列表 = fetch_all_taiwan_symbols()
+
+# 使用多線程來加速下載
+with ThreadPoolExecutor(max_workers=5) as executor:
+    futures = [executor.submit(download_annual_report, 公司) for 公司 in 公司列表]
+    for future in futures:
+        try:
+            future.result()  # 確保捕捉異常
+        except Exception as exc:
+            print(f"下載過程中出現錯誤: {exc}")
