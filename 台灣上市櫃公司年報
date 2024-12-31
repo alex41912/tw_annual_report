@@ -1,4 +1,3 @@
-# 必要的導入
 import time
 import re
 import os
@@ -8,7 +7,7 @@ from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium import webdriver
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 設置下載目錄，確認掛載了 Google Drive
 download_dir = "/content/drive/MyDrive/量化交易/"
@@ -78,7 +77,7 @@ def fetch_all_taiwan_symbols():
     # 合併上市和櫃檯股票代碼
     all_symbols_df = pd.DataFrame(twse_symbols + otc_symbols)
     filtered_df = all_symbols_df[~all_symbols_df['name'].str.contains('購')]  # 過濾掉包含 "購" 的項目
-    filtered_df = filtered_df[filtered_df['symbol'].str.len() == 4]  # 保留4位數的代碼
+    filtered_df = filtered_df[filtered_df['symbol'].str.len() == 4]  # 只保留4位數的股票代碼
     return filtered_df['symbol'].tolist()  # 回傳只包含代碼的列表
 
 # 等待下載完成檢查
@@ -86,6 +85,7 @@ def wait_for_download_to_complete(download_dir, timeout=60):
     """檢查下載是否完成，最多等待 timeout 秒"""
     end_time = time.time() + timeout
     while True:
+        # 檢查資料夾裡面檔案是否還存在 *.crdownload (Chrome 的部分下載檔)
         if not any([filename.endswith('.crdownload') for filename in os.listdir(download_dir)]):
             print("下載完成")
             return True
@@ -98,7 +98,7 @@ def wait_for_download_to_complete(download_dir, timeout=60):
 def download_annual_report(公司):
     driver = webdriver.Chrome(options=chrome_options)
     try:
-        url = f'https://doc.twse.com.tw/server-java/t57sb01?step=1&co_id={公司}&year=110&mtype=F'
+        url = f'https://doc.twse.com.tw/server-java/t57sb01?step=1&co_id={公司}&year=112&mtype=F'
         driver.get(url)
         print(f'訪問的URL：{url}')
 
@@ -164,17 +164,50 @@ def download_annual_report(公司):
 
     except TimeoutException as e:
         print(f"超時錯誤，無法下載公司代碼 {公司} 的年報: {str(e)}")
+        raise  # 重新拋出異常以便在主線程中捕捉
     finally:
         driver.quit()  # 確保在所有情況下關閉瀏覽器
 
 # 抓取所有台灣上市與櫃檯股票代碼
 公司列表 = fetch_all_taiwan_symbols()
+total_companies = len(公司列表)
+print(f"總共要抓取 {total_companies} 間公司的年報")
+
+# 初始化計數器
+success_count = 0
+failure_count = 0
+# 新增一個列表來記錄成功下載的公司
+success_companies = []
 
 # 使用多線程來加速下載
 with ThreadPoolExecutor(max_workers=5) as executor:
-    futures = [executor.submit(download_annual_report, 公司) for 公司 in 公司列表]
-    for future in futures:
+    # 提交所有下載任務
+    future_to_company = {executor.submit(download_annual_report, 公司): 公司 for 公司 in 公司列表}
+
+    # 使用 as_completed 來追蹤任務完成狀態
+    for future in as_completed(future_to_company):
+        公司 = future_to_company[future]
         try:
-            future.result()  # 確保捕捉異常
+            future.result()  # 取得任務結果，若有異常會在此拋出
+            success_count += 1
+            success_companies.append(公司)
+            print(f"已成功抓取 {公司} 的PDF檔")
         except Exception as exc:
-            print(f"下載過程中出現錯誤: {exc}")
+            failure_count += 1
+            print(f"未成功抓取 {公司}，錯誤: {exc}")
+
+        # 即時顯示當前進度
+        print(f"進度: 已成功 {success_count}, 未成功 {failure_count}, 總共 {total_companies}")
+
+# 最終結果總結
+print("下載任務完成！")
+print(f"總共要抓取 {total_companies} 間公司的年報")
+print(f"已成功抓取 {success_count} 間公司")
+print(f"未成功抓取 {failure_count} 間公司")
+
+# 顯示所有成功抓取的公司代號
+if success_companies:
+    print("成功抓取的公司代號列表：")
+    print(", ".join(success_companies))
+else:
+    print("沒有任何公司成功下載。")
